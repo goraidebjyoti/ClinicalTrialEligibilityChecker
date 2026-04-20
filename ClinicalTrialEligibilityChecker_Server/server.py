@@ -1,5 +1,5 @@
 # server.py — Unified service with separate endpoints:
-#   POST /predict/neureq  -> NEUREQ pipeline (LLM -> 10-question -> NEUREQ model)
+#   POST /predict/neureq  -> NEUREQ pipeline (LLM -> 10-question -> NEUREQ BiLSTM+AddAttn model)
 #   POST /predict/tch_clf -> Teacher Longformer reranker + optional live DeepSeek reasoning
 #
 # Notes:
@@ -23,23 +23,23 @@ from transformers import (
 )
 
 # ------------------ CONFIG (edit as needed) ------------------
-LLM_MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"     # DeepSeek LLM
-NEUREQ_STATE = "models/neureq_best.pt"                          # NEUREQ LSTM state
-PROMPT_FILE = "prompt.txt"                                      # NEUREQ prompt template
-TEACHER_MODEL_PATH = "models/best_teacher_alpha0.2.pt"
-TEACHER_MODEL_NAME = "yikuan8/Clinical-Longformer"               # tokenizer for teacher
+LLM_MODEL_NAME        = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"   # DeepSeek LLM
+NEUREQ_STATE          = "models/model_epoch_12.pt"                   # BiLSTM+AddAttn state dict
+CLINICAL_BERT_MODEL   = "emilyalsentzer/Bio_ClinicalBERT"             # frozen encoder for justifications
+PROMPT_FILE           = "prompt.txt"                                   # NEUREQ prompt template
+TEACHER_MODEL_PATH    = "models/best_teacher_alpha0.2.pt"
+TEACHER_MODEL_NAME    = "yikuan8/Clinical-Longformer"                  # tokenizer for teacher
 
-LOG_DIR = "audit_logs"
+LOG_DIR        = "audit_logs"
 NEUREQ_LOG_DIR = os.path.join(LOG_DIR, "neureq")
-TCH_LOG_DIR = os.path.join(LOG_DIR, "tch_clf")
-BATCH_LOG_DIR = os.path.join(LOG_DIR, "batch")
+TCH_LOG_DIR    = os.path.join(LOG_DIR, "tch_clf")
+BATCH_LOG_DIR  = os.path.join(LOG_DIR, "batch")
 
 os.makedirs(NEUREQ_LOG_DIR, exist_ok=True)
-os.makedirs(TCH_LOG_DIR, exist_ok=True)
-os.makedirs(BATCH_LOG_DIR, exist_ok=True)
+os.makedirs(TCH_LOG_DIR,    exist_ok=True)
+os.makedirs(BATCH_LOG_DIR,  exist_ok=True)
 
-
-MAX_NEW_TOKENS = 4096
+MAX_NEW_TOKENS      = 4096
 REASONING_MAX_TOKENS = 2048
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -64,16 +64,23 @@ QUESTIONS = [
 
 # ------------------ Globals ------------------
 tokenizer = llm = PROMPT_TEMPLATE = None
-neureq_model = None
+
+# NEUREQ — new BiLSTM model + frozen ClinicalBERT encoder
+neureq_model      = None
+bert_tokenizer    = None   # ClinicalBERT tokenizer (NEUREQ justification encoder)
+bert_model_enc    = None   # ClinicalBERT model    (NEUREQ justification encoder)
+
 # teacher (lazy)
-_teacher_model = None
+_teacher_model     = None
 _teacher_tokenizer = None
 
 # Whether to lazy-load the LLM used for live reasoning.
-# We load LLM at startup for NEUREQ by default here; if you want LLM only on-demand, set to False.
 LLM_LOADED_AT_STARTUP = True
 
-# Response mapping (preserve exact strings; others fallback to NA->0.5)
+# Answer mapping for BiLSTM embedding lookup (must match training)
+ANSWER_MAP = {"YES": 0, "NO": 1, "NA": 2}
+
+# Legacy response map kept for any downstream caller that still reads ternary floats
 RESPONSE_MAP = {"YES": 1.0, "NO": 0.0, "NA": 0.5}
 
 app = FastAPI(title="NEUREQ + TCH_CLF Server")
@@ -93,26 +100,26 @@ def _strip_think_and_fences(text: str) -> str:
     text = re.sub(r'\s*```', '', text)
     return text
 
-def _find_balanced_json_substrings(text: str) -> List[Tuple[int,int,str]]:
-    starts = []
+def _find_balanced_json_substrings(text: str) -> List[Tuple[int, int, str]]:
+    starts  = []
     results = []
-    for i,ch in enumerate(text):
+    for i, ch in enumerate(text):
         if ch == '{':
             starts.append(i)
         elif ch == '}' and starts:
             start = starts.pop()
-            end = i+1
-            results.append((start,end,text[start:end]))
+            end   = i + 1
+            results.append((start, end, text[start:end]))
     return results
 
-def _try_parse_candidates(text: str) -> Optional[Dict[str,Any]]:
+def _try_parse_candidates(text: str) -> Optional[Dict[str, Any]]:
     candidates = _find_balanced_json_substrings(text)
     if not candidates:
         return None
-    candidates.sort(key=lambda t: t[1]-t[0], reverse=True)
-    required = set(str(i) for i in range(1,11))
-    for start,end,substr in candidates:
-        s = substr.strip()
+    candidates.sort(key=lambda t: t[1] - t[0], reverse=True)
+    required = set(str(i) for i in range(1, 11))
+    for start, end, substr in candidates:
+        s       = substr.strip()
         s_clean = re.sub(r',\s*([}\]])', r'\1', s)
         try:
             parsed = json.loads(s_clean)
@@ -132,25 +139,41 @@ def _try_parse_candidates(text: str) -> Optional[Dict[str,Any]]:
                 return ans
     return None
 
-def extract_valid_json(raw_text: str) -> Optional[Dict[str,Any]]:
+def extract_valid_json(raw_text: str) -> Optional[Dict[str, Any]]:
     cleaned = _strip_think_and_fences(raw_text)
     return _try_parse_candidates(cleaned)
 
-def extract_valid_json_preserve(raw_text: str) -> Tuple[Dict[str, Dict[str,str]], list]:
+def extract_valid_json_preserve(raw_text: str) -> Tuple[Dict[str, Dict[str, str]], list]:
+    """
+    Returns:
+        cleaned_answers : dict  {str(1..10): {"response": str, "justification": str}}
+        answer_ids      : list  of int  (ANSWER_MAP indices, length 10)
+    """
     parsed = extract_valid_json(raw_text)
     if not parsed:
-        answers = {str(i): {"response":"NA", "justification":"Parsing failed"} for i in range(1,11)}
-        vector = [RESPONSE_MAP["NA"]] * 10
-        return answers, vector
-    answers, vector = {}, []
-    for i in range(1,11):
-        key = str(i)
+        answers    = {str(i): {"response": "NA", "justification": "Parsing failed"} for i in range(1, 11)}
+        answer_ids = [ANSWER_MAP["NA"]] * 10
+        return answers, answer_ids
+
+    answers, answer_ids = {}, []
+    for i in range(1, 11):
+        key       = str(i)
         raw_entry = parsed.get(key, None)
-        resp_raw = None
-        just = ""
+        resp_raw  = None
+        just      = ""
+
         if isinstance(raw_entry, dict):
-            resp_raw = raw_entry.get("response") or raw_entry.get("answer") or raw_entry.get("value")
-            just = raw_entry.get("justification") or raw_entry.get("reason") or raw_entry.get("explain") or ""
+            resp_raw = (
+                raw_entry.get("response")
+                or raw_entry.get("answer")
+                or raw_entry.get("value")
+            )
+            just = (
+                raw_entry.get("justification")
+                or raw_entry.get("reason")
+                or raw_entry.get("explain")
+                or ""
+            )
         elif isinstance(raw_entry, str):
             resp_raw = raw_entry
         elif raw_entry is None:
@@ -160,26 +183,74 @@ def extract_valid_json_preserve(raw_text: str) -> Tuple[Dict[str, Dict[str,str]]
                 resp_raw = str(raw_entry)
             except Exception:
                 resp_raw = None
-        resp_preserved = (resp_raw if resp_raw is not None else "NA")
-        resp_upper = str(resp_preserved).strip().upper()
-        vec_val = RESPONSE_MAP.get(resp_upper, RESPONSE_MAP["NA"])
+
+        resp_preserved = resp_raw if resp_raw is not None else "NA"
+        resp_upper     = str(resp_preserved).strip().upper()
+
         answers[key] = {"response": resp_preserved, "justification": (just or "").strip()}
-        vector.append(vec_val)
-    return answers, vector
+        answer_ids.append(ANSWER_MAP.get(resp_upper, ANSWER_MAP["NA"]))
 
-# ------------------ Models ------------------
+    return answers, answer_ids
 
-class NEUREQModel(nn.Module):
+
+# ------------------ NEUREQ model (BiLSTM + Additive Attention) ------------------
+
+class AdditiveAttention(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.attn = nn.Linear(hidden_dim, hidden_dim)
+        self.v    = nn.Linear(hidden_dim, 1, bias=False)
+
+    def forward(self, H):
+        scores  = self.v(torch.tanh(self.attn(H))).squeeze(-1)
+        alpha   = torch.softmax(scores, dim=1)
+        context = torch.sum(alpha.unsqueeze(-1) * H, dim=1)
+        return context, alpha
+
+
+class EligibilityBiLSTM(nn.Module):
+    """
+    Input per sample: 10 questions, each with
+        - question id  (0-9)   → Embedding(10, 8)
+        - answer id    (0-2)   → Embedding(3, 3)  [YES=0, NO=1, NA=2]
+        - justification CLS    → Bio_ClinicalBERT [768-d]
+    BiLSTM hidden = 64 (bidirectional → 128), then additive attention → classifier.
+    """
     def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(1, 64, batch_first=True)
-        self.fc = nn.Sequential(
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1), nn.Sigmoid()
+        self.question_embed = nn.Embedding(10, 8)
+        self.answer_embed   = nn.Embedding(3, 3)
+
+        self.bilstm = nn.LSTM(
+            input_size  = 8 + 3 + 768,   # q_emb + a_emb + bert_cls
+            hidden_size = 64,
+            num_layers  = 1,
+            bidirectional=True,
+            batch_first = True
         )
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.fc(out[:, -1, :])
+
+        self.attention  = AdditiveAttention(128)   # 64*2 = 128
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, q_ids, a_ids, j_embs):
+        q_emb = self.question_embed(q_ids)          # (B, 10, 8)
+        a_emb = self.answer_embed(a_ids)             # (B, 10, 3)
+
+        x = torch.cat([q_emb, a_emb, j_embs], dim=-1)  # (B, 10, 779)
+        H, _ = self.bilstm(x)                           # (B, 10, 128)
+
+        context, _ = self.attention(H)                  # (B, 128)
+        logit = self.classifier(context).squeeze(-1)    # (B,)
+        return logit
+
+
+# ------------------ Teacher Reranker (TCH_CLF — unchanged) ------------------
 
 class TeacherReranker(nn.Module):
     def __init__(self, base_model_name=TEACHER_MODEL_NAME):
@@ -191,25 +262,79 @@ class TeacherReranker(nn.Module):
         self.classifier = nn.Sequential(
             nn.Linear(hidden, 384), nn.GELU(), nn.Dropout(0.1), nn.Linear(384, 1)
         )
+
     def forward(self, input_ids, attention_mask):
         outputs = self.longformer(input_ids=input_ids, attention_mask=attention_mask)
-        cls = outputs.last_hidden_state[:,0,:]
-        logits = self.classifier(cls)
+        cls     = outputs.last_hidden_state[:, 0, :]
+        logits  = self.classifier(cls)
         return logits.squeeze(1)
+
+
+# ------------------ NEUREQ justification encoder ------------------
+
+@torch.no_grad()
+def encode_justification(text: str) -> torch.Tensor:
+    """Encode a single justification string → CLS vector [768]."""
+    inputs = bert_tokenizer(
+        text,
+        truncation=True,
+        padding="max_length",
+        max_length=128,
+        return_tensors="pt"
+    ).to(DEVICE)
+    outputs = bert_model_enc(**inputs)
+    return outputs.last_hidden_state[:, 0, :].squeeze(0)   # (768,)
+
+
+# ------------------ NEUREQ scoring function ------------------
+
+@torch.no_grad()
+def score_neureq(cleaned_answers: Optional[Dict[str, Dict[str, str]]]) -> float:
+    """
+    Score a single patient-trial pair using the new EligibilityBiLSTM.
+    Returns a probability in [0, 1] via sigmoid of the raw logit.
+    cleaned_answers == None → returns 0.0 (bottom of ranking).
+    """
+    if cleaned_answers is None:
+        return 0.0
+
+    question_ids       = []
+    answer_ids_list    = []
+    justification_embs = []
+
+    for qid in range(1, 11):
+        q         = cleaned_answers.get(str(qid), None)
+        response  = q.get("response", "NA")  if q else "NA"
+        just_text = q.get("justification", "") if q else ""
+
+        question_ids.append(qid - 1)
+        answer_ids_list.append(ANSWER_MAP.get(str(response).strip().upper(), ANSWER_MAP["NA"]))
+        justification_embs.append(encode_justification(just_text))
+
+    q_ids  = torch.tensor(question_ids,    dtype=torch.long).unsqueeze(0).to(DEVICE)  # (1,10)
+    a_ids  = torch.tensor(answer_ids_list, dtype=torch.long).unsqueeze(0).to(DEVICE)  # (1,10)
+    j_embs = torch.stack(justification_embs).unsqueeze(0).to(DEVICE)                  # (1,10,768)
+
+    logit = neureq_model(q_ids, a_ids, j_embs)                # (1,)
+    prob  = float(torch.sigmoid(logit).item())
+    return prob
+
 
 # ------------------ Startup: load essentials ------------------
 
 @app.on_event("startup")
 def startup():
-    global tokenizer, llm, PROMPT_TEMPLATE, neureq_model
-    # load prompt
+    global tokenizer, llm, PROMPT_TEMPLATE
+    global neureq_model, bert_tokenizer, bert_model_enc
+
+    # load prompt template
     try:
         with open(PROMPT_FILE, "r", encoding="utf-8") as f:
             PROMPT_TEMPLATE = f.read()
     except Exception:
-        PROMPT_TEMPLATE = "{0}\n\n{1}"  # fallback template if prompt file is unavailable
+        PROMPT_TEMPLATE = "{0}\n\n{1}"
 
-    # load LLM + tokenizer if chosen to load at startup (NEUREQ uses LLM)
+    # load LLM + tokenizer at startup (NEUREQ pipeline needs it)
     if LLM_LOADED_AT_STARTUP:
         logger.info("Loading LLM and tokenizer at startup...")
         tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
@@ -222,15 +347,25 @@ def startup():
         logger.info("LLM loaded.")
     else:
         tokenizer = None
-        llm = None
+        llm       = None
 
-    # load NEUREQ model (small)
-    neureq = NEUREQModel()
-    neureq.load_state_dict(torch.load(NEUREQ_STATE, map_location="cpu"))
-    neureq.eval()
-    global neureq_model
-    neureq_model = neureq
-    logger.info("NEUREQ model loaded (CPU). Server ready.")
+    # load frozen ClinicalBERT (justification encoder for NEUREQ)
+    logger.info("Loading Bio_ClinicalBERT (frozen justification encoder)...")
+    bert_tokenizer  = AutoTokenizer.from_pretrained(CLINICAL_BERT_MODEL)
+    bert_model_enc  = AutoModel.from_pretrained(CLINICAL_BERT_MODEL).to(DEVICE)
+    bert_model_enc.eval()
+    for p in bert_model_enc.parameters():
+        p.requires_grad = False
+    logger.info("Bio_ClinicalBERT loaded and frozen.")
+
+    # load new NEUREQ BiLSTM model
+    logger.info("Loading NEUREQ EligibilityBiLSTM...")
+    _neureq = EligibilityBiLSTM().to(DEVICE)
+    _neureq.load_state_dict(torch.load(NEUREQ_STATE, map_location=DEVICE))
+    _neureq.eval()
+    neureq_model = _neureq
+    logger.info("NEUREQ model loaded. Server ready.")
+
 
 # ------------------ Lazy loaders for teacher and LLM ------------------
 
@@ -261,6 +396,7 @@ def ensure_llm_loaded():
         logger.info("LLM loaded (lazy).")
     return tokenizer, llm
 
+
 # ------------------ Request models ------------------
 
 class NeureqRequest(BaseModel):
@@ -272,21 +408,22 @@ class TchClfRequest(BaseModel):
     trial: str
     generate_reasoning: Optional[bool] = True
 
+
 # ------------------ Batch Request Models ------------------
 
 class PatientCase(BaseModel):
-    patient_id: str
+    patient_id:   str
     patient_text: str
 
 class TrialFile(BaseModel):
-    trial_id: str
+    trial_id:   str
     trial_text: str
 
 class BatchRequest(BaseModel):
-    method: str                     # "NEUREQ" or "TCH_CLF"
-    threshold: float = 0.5
-    patients: List[PatientCase]
-    trials: List[TrialFile]
+    method:             str                     # "NEUREQ" or "TCH_CLF"
+    threshold:          float = 0.5
+    patients:           List[PatientCase]
+    trials:             List[TrialFile]
     generate_reasoning: Optional[bool] = True
 
 
@@ -295,10 +432,9 @@ class BatchRequest(BaseModel):
 @app.post("/predict/neureq")
 def predict_neureq(req: NeureqRequest):
     if tokenizer is None or llm is None:
-        # load if not loaded at startup
         ensure_llm_loaded()
 
-    # Build prompt from template
+    # Build prompt
     prompt_text = PROMPT_TEMPLATE.format(req.query, req.trial)
     seed = _stable_seed_from_prompt(prompt_text)
     try:
@@ -306,10 +442,10 @@ def predict_neureq(req: NeureqRequest):
     except Exception:
         logger.warning("Could not set torch.manual_seed for determinism")
 
-    # Prepare inputs
+    # Prepare LLM inputs
     messages = [{"role": "user", "content": prompt_text}]
-    inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
-    device = next(llm.parameters()).device
+    inputs   = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+    device   = next(llm.parameters()).device
     if isinstance(inputs, torch.Tensor):
         inputs = {"input_ids": inputs.to(device)}
     else:
@@ -325,18 +461,18 @@ def predict_neureq(req: NeureqRequest):
             pad_token_id=tokenizer.eos_token_id
         )
     gen_start = inputs["input_ids"].shape[-1]
-    raw_text = tokenizer.decode(output_ids[0][gen_start:], skip_special_tokens=True)
+    raw_text  = tokenizer.decode(output_ids[0][gen_start:], skip_special_tokens=True)
 
     # Save initial raw log
-    case_id = f"case_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    case_id  = f"case_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     log_path = os.path.join(NEUREQ_LOG_DIR, f"{case_id}.json")
     initial_log = {
-        "case_id": case_id,
-        "timestamp": datetime.now().isoformat(),
-        "patient_text": req.query,
-        "trial_text": req.trial,
+        "case_id":       case_id,
+        "timestamp":     datetime.now().isoformat(),
+        "patient_text":  req.query,
+        "trial_text":    req.trial,
         "raw_llm_output": raw_text,
-        "seed_used": int(seed)
+        "seed_used":     int(seed)
     }
     try:
         with open(log_path, "w", encoding="utf-8") as f:
@@ -344,19 +480,19 @@ def predict_neureq(req: NeureqRequest):
     except Exception as e:
         logger.error(f"Failed to write initial NEUREQ log: {e}")
 
-    # Extract JSON answers
-    cleaned_answers, vector = extract_valid_json_preserve(raw_text)
+    # Extract structured answers from LLM JSON
+    # extract_valid_json_preserve now returns (cleaned_answers, answer_ids)
+    cleaned_answers, answer_ids = extract_valid_json_preserve(raw_text)
 
-    vec_tensor = torch.tensor(vector, dtype=torch.float32).view(1, 10, 1)
-    with torch.no_grad():
-        score = float(neureq_model(vec_tensor).item())
+    # Score with new BiLSTM + Additive Attention model
+    score = score_neureq(cleaned_answers)
 
     full_log = {
         **initial_log,
         "cleaned_answers": cleaned_answers,
-        "ternary_vector": vector,
-        "final_score": round(score, 4),
-        "questions": QUESTIONS
+        "answer_ids":      answer_ids,          # [0-2] per question (YES=0, NO=1, NA=2)
+        "final_score":     round(score, 4),
+        "questions":       QUESTIONS
     }
     try:
         with open(log_path, "w", encoding="utf-8") as f:
@@ -365,17 +501,17 @@ def predict_neureq(req: NeureqRequest):
     except Exception as e:
         logger.error(f"Failed to save full NEUREQ log: {e}")
 
-    response_payload = {
-        "score": round(score, 4),
-        "seed": int(seed),
-        "raw_llm_output": raw_text,
+    return {
+        "score":           round(score, 4),
+        "seed":            int(seed),
+        "raw_llm_output":  raw_text,
         "cleaned_answers": cleaned_answers,
-        "ternary_vector": vector,
-        "final_score": round(score, 4),
-        "questions": QUESTIONS
+        "answer_ids":      answer_ids,
+        "final_score":     round(score, 4),
+        "questions":       QUESTIONS,
+        "audit_log":       log_path
     }
-    response_payload["audit_log"] = log_path
-    return response_payload
+
 
 # ------------------ TCH_CLF handler (/predict/tch_clf) ------------------
 
@@ -386,28 +522,20 @@ STOP_HEADERS = [
     "Exclusion Criteria", "Gender", "Sex", "Minimum Age", "Maximum Age", "Ages Eligible",
     "Status", "Phase", "Start Date", "Primary Completion Date", "Last Update Posted"
 ]
-# build a regex lookahead that matches newline + (one of headers) + optional spaces + colon
 STOP_RE = r"(?=\n(?:{})(?:\s*:)|$)".format("|".join([re.escape(h) for h in STOP_HEADERS]))
 
 def extract_field(pattern, text):
     m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
     return m.group(1).strip() if m else None
 
-# ---- Replaced helpers: exact functions from offline extraction pipeline ----
 def normalize_age(age_str):
-    """
-    Convert age strings into years as float.
-    Handles Years, Months, Days. Returns float in years or None for N/A/no limit.
-    Matches the offline extraction logic.
-    """
     if not age_str or str(age_str).strip().lower() in ["n/a", "na", "not applicable", "no limit"]:
         return None
-
     age_str = str(age_str).strip()
     match = re.match(r"(\d+(?:\.\d+)?)\s*(year|yr|years|yrs|month|months|mo|day|days|d)", age_str, re.IGNORECASE)
     if match:
         value = float(match.group(1))
-        unit = match.group(2).lower()
+        unit  = match.group(2).lower()
         if "year" in unit:
             return value
         elif "month" in unit:
@@ -417,18 +545,12 @@ def normalize_age(age_str):
         else:
             return None
     else:
-        # If no unit, assume years
         num_match = re.match(r"(\d+(?:\.\d+)?)", age_str, re.IGNORECASE)
         if num_match:
             return float(num_match.group(1))
         return None
 
 def normalize_gender(gender_str, eligibility_text):
-    """
-    Normalize gender based on extracted gender field or eligibility criteria.
-    Defaults to 'male and female' if unspecified.
-    Matches the offline extraction logic.
-    """
     text_to_check = ""
     if gender_str:
         text_to_check = str(gender_str).lower()
@@ -437,14 +559,13 @@ def normalize_gender(gender_str, eligibility_text):
 
     if not text_to_check:
         return "male and female"
-
     if 'all' in text_to_check:
         return "male and female"
 
-    male_terms = ['male', 'man', 'boy', 'men', 'boys']
+    male_terms   = ['male', 'man', 'boy', 'men', 'boys']
     female_terms = ['female', 'woman', 'girl', 'women', 'girls']
 
-    has_male = any(term in text_to_check for term in male_terms)
+    has_male   = any(term in text_to_check for term in male_terms)
     has_female = any(term in text_to_check for term in female_terms)
 
     if has_male and has_female:
@@ -457,53 +578,35 @@ def normalize_gender(gender_str, eligibility_text):
         return "male and female"
 
 def _normalize_incoming_trial_text(raw: str) -> str:
-    """
-    Normalize incoming trial text so that headers and newline separators are visible to regex.
-    - Convert literal backslash-n sequences (\\n) to real newlines.
-    - Normalize CRLF to LF.
-    - Trim excessive leading/trailing whitespace.
-    """
     if raw is None:
         return ""
-    # Convert literal escaped newline characters (i.e. "\\n") to real newlines
-    # Handle escaped newlines from serialized input
     t = raw.replace("\\n", "\n")
-    # Normalize CRLF -> LF
     t = t.replace("\r\n", "\n").replace("\r", "\n")
-    # Collapse repeated whitespace at ends
     return t.strip()
+
 
 @app.post("/predict/tch_clf")
 def predict_tch_clf(req: TchClfRequest):
-    # Save the original trial_text for audit (exact text that client submitted)
-    original_trial_text = req.trial
-
-    # Normalize trial text so our STOP_RE lookahead works (handles both real and escaped newlines)
+    original_trial_text   = req.trial
     normalized_trial_text = _normalize_incoming_trial_text(original_trial_text)
 
-    # 1) parse key fields from normalized trial text using robust STOP-based regexes
-    # Try to extract an NCT or registry id if present (search both original and normalized)
     trial_id = None
     m_nct = re.search(r"\b(NCT\d{6,8})\b", normalized_trial_text, re.IGNORECASE)
     if m_nct:
         trial_id = m_nct.group(1).upper()
 
-    # Use STOP_RE appended to each field pattern to ensure we stop at the next header
-    study_title = extract_field(r"Study Title:\s*(.+?)" + STOP_RE, normalized_trial_text) or None
-    # Sometimes Official Title exists separately — extract to keep title clean
+    study_title    = extract_field(r"Study Title:\s*(.+?)"     + STOP_RE, normalized_trial_text) or None
     official_title = extract_field(r"Official Title:\s*(.+?)" + STOP_RE, normalized_trial_text) or None
-    # prefer study_title if present, else official_title
     if not study_title and official_title:
         study_title = official_title
 
-    brief_summary = extract_field(r"Brief Summary:\s*(.+?)" + STOP_RE, normalized_trial_text) or None
-    conditions = extract_field(r"Conditions?:\s*(.+?)" + STOP_RE, normalized_trial_text) or None
-    gender_raw = extract_field(r"(?:Gender|Sex(?:es)? Eligible?)\s*:\s*(.+?)" + STOP_RE, normalized_trial_text)
-    min_age_raw = extract_field(r"Minimum Age:\s*(.+?)" + STOP_RE, normalized_trial_text)
-    max_age_raw = extract_field(r"Maximum Age:\s*(.+?)" + STOP_RE, normalized_trial_text)
-    eligibility_text = extract_field(r"Eligibility Criteria:\s*(.+?)" + STOP_RE, normalized_trial_text) or None
+    brief_summary    = extract_field(r"Brief Summary:\s*(.+?)"                    + STOP_RE, normalized_trial_text) or None
+    conditions       = extract_field(r"Conditions?:\s*(.+?)"                      + STOP_RE, normalized_trial_text) or None
+    gender_raw       = extract_field(r"(?:Gender|Sex(?:es)? Eligible?)\s*:\s*(.+?)" + STOP_RE, normalized_trial_text)
+    min_age_raw      = extract_field(r"Minimum Age:\s*(.+?)"                      + STOP_RE, normalized_trial_text)
+    max_age_raw      = extract_field(r"Maximum Age:\s*(.+?)"                      + STOP_RE, normalized_trial_text)
+    eligibility_text = extract_field(r"Eligibility Criteria:\s*(.+?)"             + STOP_RE, normalized_trial_text) or None
 
-    # fallback to combined ages (Ages Eligible ...)
     if not min_age_raw and not max_age_raw:
         combined_age = extract_field(r"Ages Eligible.*?:\s*(.+?)" + STOP_RE, normalized_trial_text)
         if combined_age:
@@ -514,54 +617,47 @@ def predict_tch_clf(req: TchClfRequest):
             else:
                 min_age_raw = combined_age.strip()
 
-    # Normalize ages using offline logic
     min_age_norm = normalize_age(min_age_raw) if min_age_raw else None
     max_age_norm = normalize_age(max_age_raw) if max_age_raw else None
 
-    # Set defaults exactly as offline
     if min_age_norm is None:
         min_age_norm = 0.0
     if max_age_norm is None:
         max_age_norm = 150.0
 
-    # Normalize gender using offline logic
     gender_norm = normalize_gender(gender_raw, eligibility_text)
 
-    # Build the structured extracted dict exactly like offline extraction output
     extracted = {
-        "id": trial_id,
-        "study_title": study_title,
+        "id":            trial_id,
+        "study_title":   study_title,
         "brief_summary": brief_summary,
-        "conditions": conditions,
-        "gender": gender_norm,
-        "min_age": min_age_norm,
-        "max_age": max_age_norm,
-        "eligibility": {"criteria": eligibility_text}
+        "conditions":    conditions,
+        "gender":        gender_norm,
+        "min_age":       min_age_norm,
+        "max_age":       max_age_norm,
+        "eligibility":   {"criteria": eligibility_text}
     }
 
-    # Build concatenated_text following offline concatenation rules
     parts = []
     field_order = [
-        ("study_title", extracted["study_title"]),
-        ("brief_summary", extracted["brief_summary"]),
-        ("conditions", extracted["conditions"]),
-        ("gender", extracted["gender"]),
-        ("min_age", str(extracted["min_age"]) if extracted["min_age"] is not None else None),
-        ("max_age", str(extracted["max_age"]) if extracted["max_age"] is not None else None),
-        ("eligibility", extracted["eligibility"].get("criteria"))
+        ("study_title",  extracted["study_title"]),
+        ("brief_summary",extracted["brief_summary"]),
+        ("conditions",   extracted["conditions"]),
+        ("gender",       extracted["gender"]),
+        ("min_age",      str(extracted["min_age"])  if extracted["min_age"]  is not None else None),
+        ("max_age",      str(extracted["max_age"])  if extracted["max_age"]  is not None else None),
+        ("eligibility",  extracted["eligibility"].get("criteria"))
     ]
     for nm, val in field_order:
         if val is not None and val != "":
             parts.append(f"{nm}: {val}")
     concatenated_text = " || ".join(parts)
 
-    # Diagnostic: which headers were found in normalized text (helpful when debugging)
     found_headers = []
     for h in STOP_HEADERS:
         if re.search(rf"^\s*{re.escape(h)}\s*:", normalized_trial_text, flags=re.IGNORECASE | re.MULTILINE):
             found_headers.append(h)
 
-    # 2) score with teacher reranker (lazy-load)
     teacher_model, teacher_tokenizer = load_teacher_if_needed()
     enc = teacher_tokenizer(
         req.query,
@@ -575,11 +671,9 @@ def predict_tch_clf(req: TchClfRequest):
         logit = teacher_model(enc["input_ids"], enc["attention_mask"]).item()
         score = float(torch.sigmoid(torch.tensor(logit)).item())
 
-    # 3) optional: generate deterministic live reasoning (LLM)
     reasoning_text = ""
-    reason_seed = 0
+    reason_seed    = 0
     if req.generate_reasoning:
-        # ensure llm loaded
         ensure_llm_loaded()
         reason_prompt = (
             "### Role: You are an expert in biomedical AI ...\n"
@@ -592,13 +686,13 @@ def predict_tch_clf(req: TchClfRequest):
             torch.manual_seed(reason_seed)
         except Exception:
             pass
-        messages_r = [{"role":"user","content":reason_prompt}]
-        inputs_r = tokenizer.apply_chat_template(messages_r, add_generation_prompt=True, return_tensors="pt")
+        messages_r = [{"role": "user", "content": reason_prompt}]
+        inputs_r   = tokenizer.apply_chat_template(messages_r, add_generation_prompt=True, return_tensors="pt")
         device_llm = next(llm.parameters()).device
         if isinstance(inputs_r, torch.Tensor):
             inputs_r = {"input_ids": inputs_r.to(device_llm)}
         else:
-            inputs_r = {k: v.to(device_llm) for k,v in inputs_r.items()}
+            inputs_r = {k: v.to(device_llm) for k, v in inputs_r.items()}
         with torch.no_grad():
             out_ids = llm.generate(
                 **inputs_r,
@@ -607,10 +701,9 @@ def predict_tch_clf(req: TchClfRequest):
                 temperature=0.0,
                 pad_token_id=tokenizer.eos_token_id
             )
-        gen_start = inputs_r["input_ids"].shape[-1]
+        gen_start  = inputs_r["input_ids"].shape[-1]
         raw_reason = tokenizer.decode(out_ids[0][gen_start:], skip_special_tokens=True)
-        # try parse last JSON with reasoning key
-        parsed = None
+        parsed     = None
         try:
             s = raw_reason.rfind("{")
             e = raw_reason.rfind("}") + 1
@@ -621,24 +714,23 @@ def predict_tch_clf(req: TchClfRequest):
         except Exception:
             parsed = None
         if parsed:
-            reasoning_text = parsed.get("reasoning","").strip()
+            reasoning_text = parsed.get("reasoning", "").strip()
         else:
             reasoning_text = raw_reason.strip()
 
-    # 4) save audit log containing original (raw) trial_text, normalized text, structured extracted and concatenated_text
-    case_id = f"case_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    tch_log = {
-        "case_id": case_id,
-        "timestamp": datetime.now().isoformat(),
-        "patient_text": req.query,
-        "trial_text": original_trial_text,       # verbatim client text (for trace)
-        "trial_text_normalized": normalized_trial_text,  # used by extractor
-        "found_headers": found_headers,
-        "extracted": extracted,              # structured extraction (matches offline)
-        "concatenated_text": concatenated_text,
-        "teacher_score": round(score,4),
-        "reasoning": reasoning_text,
-        "seed_used": int(reason_seed)
+    case_id  = f"case_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    tch_log  = {
+        "case_id":                case_id,
+        "timestamp":              datetime.now().isoformat(),
+        "patient_text":           req.query,
+        "trial_text":             original_trial_text,
+        "trial_text_normalized":  normalized_trial_text,
+        "found_headers":          found_headers,
+        "extracted":              extracted,
+        "concatenated_text":      concatenated_text,
+        "teacher_score":          round(score, 4),
+        "reasoning":              reasoning_text,
+        "seed_used":              int(reason_seed)
     }
     log_path = os.path.join(TCH_LOG_DIR, f"{case_id}.json")
     try:
@@ -648,16 +740,16 @@ def predict_tch_clf(req: TchClfRequest):
     except Exception as e:
         logger.error(f"Failed to save TCH_CLF log: {e}")
 
-    # Return score + reasoning + extracted (optionally include extracted in response for debug)
     return {
-        "score": round(score,4),
-        "reasoning": reasoning_text,
-        "seed": int(reason_seed),
-        "extracted": extracted,
-        "concatenated_text": concatenated_text,
-        "found_headers": found_headers,
-        "audit_log": log_path
+        "score":              round(score, 4),
+        "reasoning":          reasoning_text,
+        "seed":               int(reason_seed),
+        "extracted":          extracted,
+        "concatenated_text":  concatenated_text,
+        "found_headers":      found_headers,
+        "audit_log":          log_path
     }
+
 
 # ------------------ Batch handler (/predict/batch) ------------------
 
@@ -667,23 +759,21 @@ def predict_batch(req: BatchRequest):
     if req.method not in {"NEUREQ", "TCH_CLF"}:
         raise HTTPException(status_code=400, detail="method must be NEUREQ or TCH_CLF")
 
-    batch_id = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    batch_id  = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     batch_dir = os.path.join(BATCH_LOG_DIR, batch_id)
     os.makedirs(batch_dir, exist_ok=True)
 
     BATCH_PROGRESS[batch_id] = {
-    "status": "running",
-    "current_patient": None,
-    "current_trial_index": {},
-    "total_trials": len(req.trials),
-    "results": {}
+        "status":               "running",
+        "current_patient":      None,
+        "current_trial_index":  {},
+        "total_trials":         len(req.trials),
+        "results":              {}
     }
 
-
-    # ---- Pre-register empty patient entries (for immediate UI table) ----
     for p in req.patients:
         BATCH_PROGRESS[batch_id]["results"][p.patient_id] = {
-            "eligible_trials": [],
+            "eligible_trials":     [],
             "non_eligible_trials": []
         }
 
@@ -699,10 +789,9 @@ def predict_batch(req: BatchRequest):
         f"trials={len(req.trials)}"
     )
 
-    # Sequential execution: patient → trials
     for patient in req.patients:
 
-        eligible_trials = []
+        eligible_trials     = []
         non_eligible_trials = []
 
         patient_dir = os.path.join(batch_dir, patient.patient_id)
@@ -739,55 +828,52 @@ def predict_batch(req: BatchRequest):
             else:
                 non_eligible_trials.append(trial.trial_id)
 
-            # ---- Update batch progress (for live UI) ----
             BATCH_PROGRESS[batch_id]["current_patient"] = patient.patient_id
             BATCH_PROGRESS[batch_id]["current_trial_index"][patient.patient_id] += 1
-
             BATCH_PROGRESS[batch_id]["results"][patient.patient_id] = {
-                "eligible_trials": eligible_trials.copy(),
+                "eligible_trials":     eligible_trials.copy(),
                 "non_eligible_trials": non_eligible_trials.copy()
             }
 
-            # Lightweight per-evaluation pointer log
             eval_log = {
                 "patient_id": patient.patient_id,
-                "trial_id": trial.trial_id,
-                "method": req.method,
-                "score": round(score, 4),
-                "threshold": req.threshold,
-                "timestamp": datetime.now().isoformat(),
-                "audit_log": response.get("audit_log")
+                "trial_id":   trial.trial_id,
+                "method":     req.method,
+                "score":      round(score, 4),
+                "threshold":  req.threshold,
+                "timestamp":  datetime.now().isoformat(),
+                "audit_log":  response.get("audit_log")
             }
 
             with open(
                 os.path.join(patient_dir, f"{trial.trial_id}.json"),
-                "w",
-                encoding="utf-8"
+                "w", encoding="utf-8"
             ) as f:
                 json.dump(eval_log, f, indent=2, ensure_ascii=False)
 
         results[patient.patient_id] = {
-            "eligible_trials": eligible_trials,
+            "eligible_trials":     eligible_trials,
             "non_eligible_trials": non_eligible_trials
         }
 
     logger.info(f"Batch {batch_id} completed")
-
     BATCH_PROGRESS[batch_id]["status"] = "completed"
 
     return {
-        "batch_id": batch_id,
-        "status": "completed",
-        "method": req.method,
+        "batch_id":  batch_id,
+        "status":    "completed",
+        "method":    req.method,
         "threshold": req.threshold,
-        "results": results
+        "results":   results
     }
+
 
 @app.get("/predict/batch/status/{batch_id}")
 def get_batch_status(batch_id: str):
     if batch_id not in BATCH_PROGRESS:
         raise HTTPException(status_code=404, detail="Unknown batch_id")
     return BATCH_PROGRESS[batch_id]
+
 
 @app.get("/predict/batch/details/{batch_id}/{patient_id}/{trial_id}")
 def get_batch_details(batch_id: str, patient_id: str, trial_id: str):
@@ -800,40 +886,33 @@ def get_batch_details(batch_id: str, patient_id: str, trial_id: str):
     if not os.path.isfile(trial_log_path):
         raise HTTPException(status_code=404, detail="Trial not found")
 
-    # Load lightweight eval log
     with open(trial_log_path, "r", encoding="utf-8") as f:
         eval_log = json.load(f)
 
     response = {
-        "method": eval_log["method"],
+        "method":     eval_log["method"],
         "patient_id": patient_id,
-        "trial_id": trial_id
+        "trial_id":   trial_id
     }
 
-    # ---- NEUREQ details ----
     if eval_log["method"] == "NEUREQ":
         audit_path = eval_log.get("audit_log")
-
         if audit_path and os.path.isfile(audit_path):
             with open(audit_path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-
             response["neureq"] = {
-                "score": d["final_score"],
-                "questions": d["questions"],
+                "score":           d["final_score"],
+                "questions":       d["questions"],
                 "cleaned_answers": d["cleaned_answers"]
             }
 
-    # ---- TCH_CLF details ----
     if eval_log["method"] == "TCH_CLF":
         audit_path = eval_log.get("audit_log")
-
         if audit_path and os.path.isfile(audit_path):
             with open(audit_path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-
             response["tch_clf"] = {
-                "score": d["teacher_score"],
+                "score":     d["teacher_score"],
                 "reasoning": d.get("reasoning", ""),
                 "extracted": d.get("extracted", {})
             }
