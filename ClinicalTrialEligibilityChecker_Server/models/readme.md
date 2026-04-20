@@ -12,13 +12,18 @@ directory before running the server.
 REQUIRED MODEL FILES
 --------------------
 
-neureq_best.pt
---------------
-- Trained neural eligibility model used by the NEUREQ pipeline.
-- Implements a lightweight LSTM-based classifier.
-- Operates on a fixed-length vector derived from the 10-question
-  eligibility schema.
-- Outputs a scalar eligibility score in the range [0, 1].
+model_epoch_12.pt
+-----------------
+- Trained neural eligibility re-ranking model used in NEUREQ Phase 2.
+- Implements a BiLSTM-based sequence model with additive attention.
+- Operates over a sequence of 10 eligibility questions, where each question is
+  represented using:
+    - Question position embeddings
+    - Categorical answer embeddings (YES / NO / NA)
+    - Justification embeddings encoded using a frozen ClinicalBERT model
+- The BiLSTM captures interactions across eligibility dimensions, while the
+  attention mechanism focuses on the most decisive criteria.
+- Outputs a scalar relevance score (logit) used for re-ranking clinical trials.
 
 best_teacher_alpha0.2.pt
 ------------------------
