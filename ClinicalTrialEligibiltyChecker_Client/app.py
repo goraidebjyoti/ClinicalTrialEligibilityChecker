@@ -9,6 +9,16 @@ from urllib.parse import urljoin
 from io import StringIO
 from datetime import datetime
 
+def highlight_response(val):
+    if val == "YES":
+        return "background-color: #d4edda; color: #155724; font-weight: bold;"
+    elif val == "NO":
+        return "background-color: #f8d7da; color: #721c24; font-weight: bold;"
+    elif val == "NA":
+        return "background-color: #e2e3e5; color: #383d41; font-weight: bold;"
+    return ""
+
+
 # ----------------- Load config -----------------
 try:
     config = json.load(open("config.json"))
@@ -111,7 +121,7 @@ with left:
 with right:
     trial_text = st.text_area("Trial Text", height=250)
 
-if st.button("Check Eligibility", width="stretch"):
+if st.button("Check Eligibility", type="primary", width="stretch"):
     if not st.session_state.connected:
         st.error("Server not connected")
         st.stop()
@@ -145,7 +155,10 @@ if st.button("Check Eligibility", width="stretch"):
                     "Response": a["response"],
                     "Justification": a["justification"]
                 })
-            st.dataframe(pd.DataFrame(rows), width="stretch")
+            df = pd.DataFrame(rows)
+            styled_df = df.style.applymap(highlight_response, subset=["Response"])
+            st.dataframe(styled_df, width="stretch", hide_index=True)
+            st.caption("NA = Information not available or cannot be determined from the trial or patient description.")
 
 # =====================================================================
 # 🔹 BATCH MODE
@@ -355,7 +368,10 @@ if st.session_state.popup:
                 "Justification": a["justification"]
             })
 
-        st.dataframe(pd.DataFrame(rows), width="stretch")
+        df = pd.DataFrame(rows)
+        styled_df = df.style.applymap(highlight_response, subset=["Response"])
+        st.dataframe(styled_df, width="stretch", hide_index=True)
+        st.caption("NA = Information not available or cannot be determined from the trial or patient description.")
         st.success(f"Final Score: {details['neureq']['score']:.4f}")
 
     elif details["method"] == "TCH_CLF":
