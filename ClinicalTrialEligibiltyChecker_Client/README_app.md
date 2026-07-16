@@ -1,6 +1,6 @@
 # app.py
 
-Streamlit front-end for the patient–trial eligibility service. This file
+Streamlit front-end for the patient–trial eligibility system. This file
 contains no model logic — it builds HTTP requests against the FastAPI
 backend (`server.py`) and renders whatever JSON comes back. It supports two
 workflows: a synchronous single-pair check, and a batch job (multiple
